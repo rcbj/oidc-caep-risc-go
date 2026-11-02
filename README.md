@@ -65,7 +65,7 @@ The mechanism is `COPY demo demo` in the final stage, after the Go binary is bui
 
 The container entrypoint also refreshes the file from the provider at start, because a development iya-sts makes a new CA when it restarts. A failed refresh keeps the file from the build. `TLS_CA_REFRESH=0` turns the refresh off. `python3 scripts/trust_chain.py --config demo/oidc.json` refreshes it by hand.
 
-When the install script creates the test user and iya-sts generates its password, the password is written to `demo/generated/<user>.password` (mode 0600), not printed.
+When the install script creates the test user and iya-sts generates its password, the password is written to `demo/generated/<user>.password` (created 0600), not printed; only that path is. No script prints the client secret, the path of the file that holds it, or a plan built from it: `--dry-run` shows `<client secret>`, and the client-secret file is created 0600.
 
 ## Demo
 

@@ -96,8 +96,10 @@ def usage():
                   (default: unset; $PUBLIC_URL). Without it, a loopback redirect follows the
                   running demo's PORT, then $PORT. A non-loopback redirect is left as written.
   --test-user     The test user to create (default: oidc-demo-user). Its password is
-                  $OIDC_DEMO_USER_PASSWORD, or one is generated and printed once. With that variable
-                  set, an existing user's password is replaced.
+                  $OIDC_DEMO_USER_PASSWORD, or one is generated and written to
+                  generated/<user>.password beside the configuration (mode 0600); only
+                  the path is printed. With that variable set, an existing user's
+                  password is replaced.
   --no-test-user  Do not create a test user.
   --dry-run       Print what would be done, and send nothing. Does not write a secret.
 
@@ -404,10 +406,13 @@ def _mint_admin_token(base, ca, secret):
     return reply["body"]["access_token"]
 
 
-def _write_secret(path, secret):
+def _write_private(path, value):
+    """Write a file only its owner can read: created 0600, never wider."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(f"{secret}\n", encoding="utf-8")
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as out:
+        os.fchmod(out.fileno(), stat.S_IRUSR | stat.S_IWUSR)
+        out.write(f"{value}\n")
 
 
 def container_port(cwd=None):
@@ -459,13 +464,14 @@ def main(argv=None):
     if args["dryRun"]:
         if files.get("tlsCa"):
             print(f"# would save {origin}'s listener CA trust chain to {files['tlsCa']}")
+        # Nothing printed here comes from the client secret or from where
+        # clientSecret keeps it: a fixed label, and a placeholder in the plan.
         if not on_disk:
-            print(f"# would write a new client secret to {files['secretFile']} (mode 0600)")
+            print("# would write a new client secret to the file clientSecret names (mode 0600)")
         else:
-            print(f"# would keep the client secret at {files['secretFile']}")
-        placeholder = on_disk or "<a new client secret>"
-        for call in plan_for(files, base, args["testUser"], placeholder):
-            printed = json.dumps(call.get("body") or {}, indent=2).replace(placeholder, "<client secret>")
+            print("# would keep the client secret in the file clientSecret names")
+        for call in plan_for(files, base, args["testUser"], "<client secret>"):
+            printed = json.dumps(call.get("body") or {}, indent=2)
             print(f"{call['method']} {call['path']}  # {call['when']}: {call['why']}\n{printed}")
         return
     ca = None
@@ -499,11 +505,11 @@ def main(argv=None):
     if created["body"].get("ok"):
         fresh = True
         if minted:
-            _write_secret(files["secretFile"], secret)
-        print(f"Registered {files['clientId']}. The client secret is {files['secretFile']}.")
+            _write_private(files["secretFile"], secret)
+        print(f"Registered {files['clientId']}. The client secret is in the file clientSecret names.")
     elif any("already in this registry" in item.lower() or "already in this registry" in item for item in _errors_of(created["body"])):
         if minted:
-            raise RuntimeError(f"{files['clientId']} already exists, and {files['secretFile']} is missing. This script does not rotate the client secret. Restore that file, or set a new secret on the application, then re-run.")
+            raise RuntimeError(f"{files['clientId']} already exists, and the file clientSecret names is missing. This script does not rotate the client secret. Restore that file, or set a new secret on the application, then re-run.")
         print(f"{files['clientId']} is already registered; adding the demo's values. The client secret is unchanged.")
         for call in plan:
             if call["when"] != "exists":
@@ -551,7 +557,7 @@ def main(argv=None):
                 # Never printed: a password does not belong in a log. It goes to a
                 # file only its owner can read, in demo/generated, which never
                 # enters an image (.dockerignore admits only tlsCa's chain).
-                saved = Path(files["secretFile"]).parent / f"{args['testUser']}.password"
+                saved = Path(args["config"]).resolve().parent / "generated" / f"{args['testUser']}.password"
                 saved.parent.mkdir(parents=True, exist_ok=True)
                 descriptor = os.open(saved, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(descriptor, "w", encoding="utf-8") as out:
