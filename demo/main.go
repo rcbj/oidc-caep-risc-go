@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"html"
+	"html/template"
 	"io"
 	"net/http"
 	"net/url"
@@ -228,7 +229,7 @@ func (a *app) route(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			fmt.Fprintf(os.Stderr, "demo: %v\n", recovered)
-			a.send(w, 500, page("Error", fmt.Sprintf("<h1>Something went wrong</h1><p class=\"problem\">%s</p><p><a href=\"/\">Home</a></p>", html.EscapeString(fmt.Sprint(recovered)))), "text/html; charset=utf-8", nil)
+			a.send(w, 500, page("Error", message("Something went wrong", "The demo could not answer this request. The details are in its log.", "Home")), "text/html; charset=utf-8", nil)
 		}
 	}()
 	path := r.URL.Path
@@ -373,12 +374,12 @@ func (a *app) rememberLiveEvent(event oidc.SignalEvent) {
 func (a *app) login(w http.ResponseWriter, r *http.Request) {
 	rp, err := a.relyingParty()
 	if err != nil {
-		a.send(w, 500, page("Error", "<h1>Something went wrong</h1><p class=\"problem\">"+html.EscapeString(err.Error())+"</p>"), "text/html; charset=utf-8", nil)
+		a.send(w, 500, page("Error", message("Something went wrong", err.Error(), "")), "text/html; charset=utf-8", nil)
 		return
 	}
 	request, err := rp.Authorize()
 	if err != nil {
-		a.send(w, 500, page("Error", "<h1>Something went wrong</h1><p class=\"problem\">"+html.EscapeString(err.Error())+"</p>"), "text/html; charset=utf-8", nil)
+		a.send(w, 500, page("Error", message("Something went wrong", err.Error(), "")), "text/html; charset=utf-8", nil)
 		return
 	}
 	txn := map[string]string{"state": request.State, "nonce": request.Nonce, "code_verifier": request.CodeVerifier, "redirect_uri": request.RedirectURI}
@@ -389,7 +390,7 @@ func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 	rp, err := a.relyingParty()
 	clear := a.cookie(cookieTxn, "", "/callback", 0)
 	if err != nil {
-		a.send(w, 500, page("Error", "<h1>Something went wrong</h1><p class=\"problem\">"+html.EscapeString(err.Error())+"</p>"), "text/html; charset=utf-8", []string{clear})
+		a.send(w, 500, page("Error", message("Something went wrong", err.Error(), "")), "text/html; charset=utf-8", []string{clear})
 		return
 	}
 	query := map[string]string{}
@@ -400,7 +401,7 @@ func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 	}
 	txn := a.unseal(cookieValue(r, cookieTxn))
 	if txn == nil {
-		a.send(w, 400, page("Sign-in failed", "<h1>Sign-in failed</h1><p class=\"problem\">validation: this callback is not a sign-in this browser started</p><p><a href=\"/\">Start again</a></p>"), "text/html; charset=utf-8", []string{clear})
+		a.send(w, 400, page("Sign-in failed", message("Sign-in failed", "validation: this callback is not a sign-in this browser started", "Start again")), "text/html; charset=utf-8", []string{clear})
 		return
 	}
 	request := &oidc.Transaction{State: txn["state"], Nonce: txn["nonce"], CodeVerifier: txn["code_verifier"], RedirectURI: txn["redirect_uri"]}
@@ -410,7 +411,7 @@ func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 		if oe, ok := err.(*oidc.OidcError); ok {
 			what = oe.Code + ": " + oe.Error()
 		}
-		a.send(w, 400, page("Sign-in failed", "<h1>Sign-in failed</h1><p class=\"problem\">"+html.EscapeString(what)+"</p><p><a href=\"/\">Start again</a></p>"), "text/html; charset=utf-8", []string{clear})
+		a.send(w, 400, page("Sign-in failed", message("Sign-in failed", what, "Start again")), "text/html; charset=utf-8", []string{clear})
 		return
 	}
 	sid := randomToken()
@@ -593,6 +594,22 @@ func (a *app) redirect(w http.ResponseWriter, status int, location string, cooki
 		w.Header().Add("Set-Cookie", cookie)
 	}
 	w.WriteHeader(status)
+}
+
+// messageTemplate draws the demo's message pages. html/template escapes each
+// value for the context it lands in, so an error text that carries quotes or
+// markup (an authorization server's error_description, a JSON fragment) stays
+// text.
+var messageTemplate = template.Must(template.New("message").Parse(
+	`<h1>{{.Heading}}</h1><p class="problem">{{.Problem}}</p>{{if .Link}}<p><a href="/">{{.Link}}</a></p>{{end}}`))
+
+func message(heading, problem, link string) string {
+	var out strings.Builder
+	if err := messageTemplate.Execute(&out, struct{ Heading, Problem, Link string }{heading, problem, link}); err != nil {
+		fmt.Fprintf(os.Stderr, "demo: message page: %v\n", err)
+		return "<h1>Something went wrong</h1>"
+	}
+	return out.String()
 }
 
 func page(title, body string) string {
