@@ -48,7 +48,7 @@ The tests build an in-process stub provider and a stub transmitter. They do not 
 |---|---|
 | `*.go` | The library, package `oidc`. Module `github.com/rcbj/oidc-caep-risc-go`. |
 | `*_test.go` | `go test` ports of the Python relying-party and Shared Signals tests. |
-| `demo` | `demo/main.go`. Config is `demo/oidc.json`. |
+| `demo` | `demo/main.go`. Config is `demo/oidc.json`. Its message pages are drawn with `html/template` (`demo/main_test.go`). |
 | `scripts/configure_iya_sts.py` | Registers the confidential client on iya-sts and writes the listener CA trust chain to the file `tlsCa` names. Loopback redirects follow the running container's `PORT`, then the shell `PORT`. |
 | `scripts/live_iya_sts.py` | The live sign-in against iya-sts, separate from the unit suite. |
 | `Dockerfile`, `docker-compose.yml` | The demo image. Compose uses host networking. |

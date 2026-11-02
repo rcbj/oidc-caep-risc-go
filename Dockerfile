@@ -11,7 +11,7 @@ WORKDIR /src
 COPY go.mod ./
 COPY *.go ./
 COPY scripts scripts
-COPY demo/main.go demo/oidc.json demo/
+COPY demo/main.go demo/main_test.go demo/oidc.json demo/
 COPY demo/public demo/public
 RUN go test ./...
 

@@ -14,7 +14,7 @@ Go 1.27. Cryptography is the standard library.
 |---|---|
 | package `oidc` | The library. `FromFile`, `Authorize`, `Complete`. |
 | `*_test.go` | `go test ./...`. A stub provider and a stub transmitter. No live iya-sts. `trust_chain_test.go`: the install script writes the whole chain to `tlsCa`'s path; the library trusts an HTTPS provider through that file, checks the host name, and refuses a forged leaf before the real CAs. |
-| `demo` | `demo/main.go` and `demo/public/`. Config is `demo/oidc.json`. |
+| `demo` | `demo/main.go` and `demo/public/`. Config is `demo/oidc.json`. Message pages (errors, a failed sign-in) go through `message()`, an `html/template`, never string concatenation; `demo/main_test.go` checks it escapes the problem text. |
 | `scripts` | `configure_iya_sts.py` registers the confidential client and writes the listener CA trust chain to the file `tlsCa` names. `trust_chain.py` holds `save_trust_chain()` and refreshes that file. `live_iya_sts.py` is the live sign-in, separate from the unit suite. |
 | `Dockerfile`, `docker-compose.yml` | The demo image. Compose uses host networking. |
 
