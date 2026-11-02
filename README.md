@@ -32,9 +32,11 @@ Tokens stay in this process. Keep the transaction until the browser returns.
 
 ## Tests
 
-```sh
-go test ./...
+```bash
+docker build --target test .
 ```
+
+The suite runs in a container.
 
 The tests build an in-process stub provider and a stub transmitter. They do not need a live iya-sts.
 
@@ -53,7 +55,7 @@ The tests build an in-process stub provider and a stub transmitter. They do not 
 `PORT` defaults to 3000. A loopback redirect and post-logout URL follow `PORT`. Any other host is left as written. An explicit `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path. The default `http://localhost:3000` is not an explicit public URL.
 
 ```sh
-go run ./demo
+docker compose up --build
 ```
 
 `GET /healthz` returns `ok`. `GET /` is the page. `GET /login` starts `Authorize` and redirects. `GET /callback` completes the code exchange. `POST /logout` signs the local session out.

@@ -20,10 +20,6 @@ Go 1.27. Cryptography is the standard library.
 
 ## Usage
 
-```sh
-go test ./...
-```
-
 ```go
 rp, err := oidc.FromFile("oidc.json")
 request, err := rp.Authorize()
@@ -34,16 +30,18 @@ Keep the transaction (`State`, nonce, code verifier) until the browser returns. 
 
 ## Tests
 
-```sh
-go test ./...
+```bash
+docker build --target test .
 ```
+
+The `test` stage runs `go test ./...` in `golang:1.27-bookworm`. GitHub Actions uses that command. Do not run the Go toolchain on the host. The demo image does not run the suite.
 
 ## Demo
 
 `docker-compose.yml` sets `network_mode: host`. The process binds `PORT`, default 3000. `ENV PORT=3000` in the image keeps an unset value on 3000, and the health check calls `http://127.0.0.1:${PORT}/healthz`.
 
 ```sh
-go run ./demo
+docker compose up --build
 ```
 
 `GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session.
