@@ -40,6 +40,8 @@ The suite runs in a container.
 
 The tests build an in-process stub provider and a stub transmitter. They do not need a live iya-sts.
 
+`python3 scripts/live_iya_sts.py` is the live half. It builds this demo image, starts iya-sts when `IYA_STS_URL` is unset, registers the demo, signs in, and requires a credential-change event and a session-revoked event on `GET /live-status`. The second event ends the local session. It never binds port 3000 or 8081. The nightly workflow runs the unit suite and this script. `.github/workflows/nightly.yml` runs at 07:18 UTC (`18 7 * * *`) and on `workflow_dispatch`. `IYA_STS_IMAGE` starts a fresh container from an image already built; without it or `IYA_STS_URL` the script clones and builds iya-sts `main`. `LIVE_STS_PORT` defaults to 18520 and `LIVE_DEMO_PORT` to 18620; the script refuses 3000, 8081, and 18481 through 18495. Registration runs `scripts/configure_iya_sts.py` with the host's stdlib python3, never Go. Always use a fresh iya-sts: a second registration of the same client fails.
+
 ## Layout
 
 | Path | What it is |
@@ -48,6 +50,7 @@ The tests build an in-process stub provider and a stub transmitter. They do not 
 | `*_test.go` | `go test` ports of the Python relying-party and Shared Signals tests. |
 | `demo` | `demo/main.go`. Config is `demo/oidc.json`. |
 | `scripts/configure_iya_sts.py` | Registers the confidential client on iya-sts. Loopback redirects follow the running container's `PORT`, then the shell `PORT`. |
+| `scripts/live_iya_sts.py` | The live sign-in against iya-sts, separate from the unit suite. |
 | `Dockerfile`, `docker-compose.yml` | The demo image. Compose uses host networking. |
 
 ## Demo
@@ -58,7 +61,7 @@ The tests build an in-process stub provider and a stub transmitter. They do not 
 docker compose up --build
 ```
 
-`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` starts `Authorize` and redirects. `GET /callback` completes the code exchange. `POST /logout` signs the local session out.
+`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` starts `Authorize` and redirects. `GET /callback` completes the code exchange. `POST /logout` signs the local session out. `GET /live-status` is JSON for the sign-in and the Shared Signals events this process has accepted. It does not include tokens.
 
 `docker-compose.yml` sets `network_mode: host`. The image sets `ENV PORT=3000`. The health check calls `http://127.0.0.1:${PORT}/healthz`. The running container's `PORT` wins over the shell's when `scripts/configure_iya_sts.py` registers the application.
 
