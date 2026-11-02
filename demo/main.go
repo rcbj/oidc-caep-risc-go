@@ -37,6 +37,11 @@ type session struct {
 	Expires float64
 }
 
+type liveEvent struct {
+	Type string  `json:"type"`
+	JTI  *string `json:"jti"`
+}
+
 type app struct {
 	mu            sync.Mutex
 	sessions      map[string]*session
@@ -50,6 +55,7 @@ type app struct {
 	loaded        bool
 	receiver      *oidc.SignalsReceiver
 	receiverState string
+	events        []liveEvent
 }
 
 func main() {
@@ -230,6 +236,10 @@ func (a *app) route(w http.ResponseWriter, r *http.Request) {
 		a.send(w, 200, "ok", "text/plain", nil)
 		return
 	}
+	if path == "/live-status" && r.Method == http.MethodGet {
+		a.liveStatus(w, r)
+		return
+	}
 	if path == "/styles.css" && r.Method == http.MethodGet {
 		raw, _ := assets.ReadFile("public/styles.css")
 		a.send(w, 200, string(raw), "text/css; charset=utf-8", nil)
@@ -304,6 +314,60 @@ func (a *app) home(w http.ResponseWriter, r *http.Request) {
 	}
 	body := "<h1>Sign in with OpenID Connect</h1>" + problemHTML + "<p>This application is a confidential client" + issuer + ". It sends the browser to the authorization endpoint (Authorization Code, PKCE S256) and takes the tokens on the back channel.</p><p class=\"buttons\"><a class=\"button primary\" href=\"/login\">Sign in with OpenID Connect</a></p>"
 	a.send(w, 200, page("Sign in", body), "text/html; charset=utf-8", nil)
+}
+
+// liveStatus reports the sign-in and the Shared Signals events this process
+// has accepted, for scripts/live_iya_sts.py. It never includes a token.
+func (a *app) liveStatus(w http.ResponseWriter, r *http.Request) {
+	_, sess := a.sessionOf(r)
+	var subject any
+	if sess != nil && sess.Login != nil {
+		who := sess.Login.PreferredUsername
+		if who == "" {
+			who = sess.Login.Email
+		}
+		if who == "" {
+			who = sess.Login.Subject
+		}
+		if who != "" {
+			subject = who
+		}
+	}
+	a.mu.Lock()
+	events := append([]liveEvent{}, a.events...)
+	state := a.receiverState
+	a.mu.Unlock()
+	raw, _ := json.Marshal(map[string]any{
+		"signedIn": sess != nil,
+		"subject":  subject,
+		"receiver": state,
+		"events":   events,
+	})
+	a.send(w, 200, string(raw), "application/json", nil)
+}
+
+// rememberLiveEvent records an accepted event for /live-status. The receiver
+// ends a session only when the event's IdP session id matches one it tracks.
+// A session-revoked that matched none leaves this demo's one login in place,
+// so the demo ends that one local session and untracks it.
+func (a *app) rememberLiveEvent(event oidc.SignalEvent) {
+	var jti *string
+	if event.JTI != "" {
+		value := event.JTI
+		jti = &value
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.events = append(a.events, liveEvent{Type: event.Type, JTI: jti})
+	if event.Type != oidc.Event["sessionRevoked"] || len(event.Sessions) != 0 || len(a.sessions) != 1 {
+		return
+	}
+	for sid := range a.sessions {
+		delete(a.sessions, sid)
+		if a.receiver != nil {
+			a.receiver.Untrack(sid)
+		}
+	}
 }
 
 func (a *app) login(w http.ResponseWriter, r *http.Request) {
@@ -455,6 +519,7 @@ func (a *app) startReceiver(rp *oidc.RelyingParty) {
 		fmt.Fprintf(os.Stderr, "ssf: the receiver did not start: %v\n", err)
 		return
 	}
+	receiver.On("*", a.rememberLiveEvent)
 	a.receiver = receiver
 	if err := receiver.Start(); err != nil {
 		a.receiver = nil
