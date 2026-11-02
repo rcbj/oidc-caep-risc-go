@@ -1,1 +1,6 @@
 .git
+# demo/generated holds the client secret and any password the install script
+# wrote. Only tlsCa's file, the iya-sts listener CA trust chain, goes into the
+# demo image (Dockerfile, COPY demo demo).
+demo/generated/*
+!demo/generated/idp-ca.pem

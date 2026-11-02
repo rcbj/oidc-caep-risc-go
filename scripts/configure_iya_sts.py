@@ -5,6 +5,11 @@
 The running container's PORT wins over the shell PORT. A loopback redirect follows that
 port. An explicit --public-url or PUBLIC_URL replaces the origin and keeps the path.
 The default http://localhost:3000 is not an explicit public URL.
+
+Every run writes iya-sts's listener CA trust chain (leaf, TLS Issuing CA, Intermediate, Root) to the
+file tlsCa names (demo default generated/idp-ca.pem), through scripts/trust_chain.py. The demo image
+build copies that file in, so rebuild the image after running this against a different iya-sts.
+A generated test-user password goes to demo/generated/<user>.password (mode 0600), never to stdout.
 """
 
 import http.client
@@ -29,6 +34,7 @@ TIMEOUT_S = 15
 def _ssl_context(tls):
     tls = tls or {}
     context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     ca = tls.get("ca")
     if ca:
         context.load_verify_locations(cadata=ca)
@@ -542,7 +548,15 @@ def main(argv=None):
                 raise RuntimeError(f"creating {args['testUser']} was refused: {json.dumps(made['body'])[:300]}")
             print(f"Created user {args['testUser']}.")
             if made["body"].get("password"):
-                print(f"Generated password for {args['testUser']} (shown once): {made['body']['password']}")
+                # Never printed: a password does not belong in a log. It goes to a
+                # file only its owner can read, in demo/generated, which never
+                # enters an image (.dockerignore admits only tlsCa's chain).
+                saved = Path(files["secretFile"]).parent / f"{args['testUser']}.password"
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                descriptor = os.open(saved, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as out:
+                    out.write(made["body"]["password"] + "\n")
+                print(f"Generated a password for {args['testUser']}; it is in {saved} (readable by you only).")
         for call in plan:
             if not call["path"].endswith("/groups/add-member"):
                 continue
@@ -555,6 +569,8 @@ def main(argv=None):
     print(f"metadata:  {files['metadataUrl']}")
     print(f"redirect:  {files['redirectUri']}")
     print(f"auth:      {files['tokenEndpointAuthMethod']}")
+    if files.get("tlsCa"):
+        print("The demo image build copies the tlsCa trust chain in. Rebuild it after running this against another iya-sts.")
     print("Done. Start the demo with: docker compose up --build")
 
 
