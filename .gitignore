@@ -1,0 +1,11 @@
+demo/generated/
+bin/
+obj/
+*.exe
+*.test
+vendor/
+oidc-caep-risc-demo
+__pycache__/
+*.pyc
+venv/
+.venv/
