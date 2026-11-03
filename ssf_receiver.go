@@ -41,8 +41,14 @@ type SignalEvent struct {
 }
 
 // ReceiverOptions are the optional parts of a SignalsReceiver.
+// Client makes every call to the transmitter with Client's client-credentials
+// token for Scope (default ssf.manage), with a DPoP proof when that token is
+// DPoP-bound, and clears the session cache entry of every session an event
+// ends. Headers, when Client is nil, supplies the headers instead.
 type ReceiverOptions struct {
 	TLS             map[string]string
+	Client          *RelyingParty
+	Scope           string
 	Headers         func() map[string]string
 	EventsRequested []string
 	EndOn           []string
@@ -65,6 +71,8 @@ type SignalsReceiver struct {
 	transmitter     string
 	onEnd           func([]string, SignalEvent)
 	tls             map[string]string
+	client          *RelyingParty
+	scope           string
 	headers         func() map[string]string
 	eventsRequested []string
 	endOn           []string
@@ -119,6 +127,10 @@ func NewSignalsReceiver(transmitter string, onEnd func([]string, SignalEvent), o
 	if log == nil {
 		log = stdLogger{}
 	}
+	scope := opts.Scope
+	if scope == "" {
+		scope = "ssf.manage"
+	}
 	index := opts.Index
 	if index == nil {
 		index = NewSessionIndex(0)
@@ -127,6 +139,8 @@ func NewSignalsReceiver(transmitter string, onEnd func([]string, SignalEvent), o
 		transmitter:     strings.TrimRight(transmitter, "/"),
 		onEnd:           onEnd,
 		tls:             opts.TLS,
+		client:          opts.Client,
+		scope:           scope,
 		headers:         opts.Headers,
 		eventsRequested: events,
 		endOn:           endOn,
@@ -177,7 +191,17 @@ func (r *SignalsReceiver) call(method, rawURL string, body any) (int, any, strin
 		payload = &text
 		headers["content-type"] = "application/json"
 	}
-	answer, err := send(rawURL, method, headers, payload, r.tls, "ssf")
+	var answer httpAnswer
+	var err error
+	if r.client != nil {
+		access, ccErr := r.client.ClientCredentials(r.scope)
+		if ccErr != nil {
+			return 0, nil, "", ccErr
+		}
+		answer, err = r.client.resourceSend(method, rawURL, access.AccessToken, access.TokenType, headers, payload, r.tls, "ssf")
+	} else {
+		answer, err = send(rawURL, method, headers, payload, r.tls, "ssf")
+	}
 	if err != nil {
 		return 0, nil, "", err
 	}
@@ -651,6 +675,11 @@ func (r *SignalsReceiver) handle(jti, token string) error {
 			if event.Ended {
 				for _, localID := range sessions {
 					r.index.Remove(localID)
+					if r.client != nil {
+						if err := r.client.RemoveSession(localID); err != nil {
+							r.log.Warn("ssf: the session cache entry for an ended session was not removed: " + err.Error())
+						}
+					}
 				}
 			}
 		}

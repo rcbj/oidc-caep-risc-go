@@ -104,18 +104,181 @@ func isLoopback(hostname string) bool {
 	return hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" || hostname == "[::1]"
 }
 
-func checkRedirect(value, name string, allowInsecure bool) (string, error) {
+// checkRedirect is the redirect-URI rule: https, or http on a loopback host
+// (localhost, 127.0.0.1, [::1]). allowInsecure does not widen it.
+func checkRedirect(value, name string) (string, error) {
 	parts, err := url.Parse(value)
 	if err != nil || (parts.Scheme != "http" && parts.Scheme != "https") || parts.Hostname() == "" {
 		return "", fmtErr("config", "%s is not a URL: %s", name, value)
 	}
+	if parts.Fragment != "" {
+		return "", fmtErr("config", "%s must not carry a fragment: %s", name, value)
+	}
 	if parts.Scheme == "https" {
 		return value, nil
 	}
-	if parts.Scheme == "http" && (isLoopback(parts.Hostname()) || allowInsecure) {
+	if isLoopback(parts.Hostname()) {
 		return value, nil
 	}
-	return "", fmtErr("config", "%s must use https, or http on loopback: %s", name, value)
+	return "", fmtErr("config", "%s must use https, or http on a loopback host (localhost, 127.0.0.1, [::1]): %s", name, value)
+}
+
+// applySettings fills the defaults and checks the settings that FromFile,
+// ResolveConfig and Create share, in place. It is idempotent, so a
+// configuration ResolveConfig already returned passes through Create
+// unchanged, and one written by hand gets the same defaults and rules.
+func applySettings(cfg map[string]any) error {
+	clientID := strings.TrimSpace(firstString(cfg, "clientId", "client_id"))
+	if clientID == "" {
+		return errCode("config", "client_id is required")
+	}
+	cfg["clientId"] = clientID
+	delete(cfg, "client_id")
+	method := sprint(cfg["tokenEndpointAuthMethod"])
+	if method == "" {
+		method = "client_secret_basic"
+	}
+	if method == "none" {
+		return errCode("config", `tokenEndpointAuthMethod "none" is a public client; this library authenticates a confidential client`)
+	}
+	if !containsString(authMethods, method) {
+		return fmtErr("config", "tokenEndpointAuthMethod must be %s, not %s", strings.Join(authMethods, ", "), method)
+	}
+	cfg["tokenEndpointAuthMethod"] = method
+	redirectURI := strings.TrimSpace(firstString(cfg, "redirectUri", "redirect_uri"))
+	if redirectURI == "" {
+		return errCode("config", "redirectUri is required")
+	}
+	checked, err := checkRedirect(redirectURI, "redirectUri")
+	if err != nil {
+		return err
+	}
+	cfg["redirectUri"] = checked
+	delete(cfg, "redirect_uri")
+	if post := strings.TrimSpace(firstString(cfg, "postLogoutRedirectUri", "post_logout_redirect_uri")); post != "" {
+		checked, err := checkRedirect(post, "postLogoutRedirectUri")
+		if err != nil {
+			return err
+		}
+		cfg["postLogoutRedirectUri"] = checked
+	}
+	delete(cfg, "post_logout_redirect_uri")
+	if strings.TrimSpace(sprint(cfg["scopes"])) == "" {
+		scopes := strings.TrimSpace(DefaultScopes)
+		if cfg["signals"] == false {
+			var kept []string
+			for _, part := range strings.Fields(scopes) {
+				if part != "ssf.read" && part != "ssf.manage" {
+					kept = append(kept, part)
+				}
+			}
+			scopes = strings.Join(kept, " ")
+		}
+		cfg["scopes"] = scopes
+	}
+	if !containsString(strings.Fields(sprint(cfg["scopes"])), "openid") {
+		return errCode("config", "scopes must include openid")
+	}
+	for _, name := range []string{"par", "dpop"} {
+		mode := "auto"
+		if v, ok := cfg[name]; ok && v != nil && sprint(v) != "" {
+			mode = sprint(v)
+		}
+		if mode != "auto" && mode != "always" && mode != "never" {
+			return fmtErr("config", "%s must be auto, always, or never", name)
+		}
+		cfg[name] = mode
+	}
+	if text := strings.TrimSpace(sprint(cfg["dpopKey"])); text != "" {
+		cfg["dpopKey"] = text
+	} else {
+		delete(cfg, "dpopKey")
+	}
+	tolerance, err := numberSetting(cfg, "clockToleranceSec", 30, true)
+	if err != nil {
+		return err
+	}
+	cfg["clockToleranceSec"] = tolerance
+	age, err := numberSetting(cfg, "maxIdTokenAgeSec", 600, false)
+	if err != nil {
+		return err
+	}
+	cfg["maxIdTokenAgeSec"] = age
+	if v, ok := cfg["idTokenSigningAlgs"]; ok && v != nil {
+		var list []string
+		if text, isText := v.(string); isText {
+			list = strings.Fields(strings.ReplaceAll(text, ",", " "))
+		} else if items, isList := asStringList(v); isList {
+			for _, item := range items {
+				if item = strings.TrimSpace(item); item != "" {
+					list = append(list, item)
+				}
+			}
+		} else {
+			return errCode("config", "idTokenSigningAlgs must be a list of JWS algorithm names")
+		}
+		if len(list) == 0 {
+			return errCode("config", "idTokenSigningAlgs must name at least one algorithm")
+		}
+		for _, alg := range list {
+			if strings.EqualFold(alg, "none") {
+				return errCode("config", `idTokenSigningAlgs must not name "none"; an unsigned ID token is never accepted`)
+			}
+			if _, known := algSpecs[alg]; !known {
+				return fmtErr("config", "idTokenSigningAlgs names %s, which this client cannot verify", alg)
+			}
+		}
+		cfg["idTokenSigningAlgs"] = list
+	} else {
+		cfg["idTokenSigningAlgs"] = append([]string(nil), DefaultIDTokenSigningAlgs...)
+	}
+	if pinned := sprint(cfg["idTokenSignedResponseAlg"]); pinned != "" {
+		if strings.EqualFold(pinned, "none") {
+			return errCode("config", `idTokenSignedResponseAlg must not be "none"; an unsigned ID token is never accepted`)
+		}
+		if _, known := algSpecs[pinned]; !known {
+			return fmtErr("config", "idTokenSignedResponseAlg is %s, which this client cannot verify", pinned)
+		}
+	} else {
+		delete(cfg, "idTokenSignedResponseAlg")
+	}
+	if v, ok := cfg["requireIdTokenTypAndAtHash"]; !ok || v == nil {
+		cfg["requireIdTokenTypAndAtHash"] = true
+	} else if _, isBool := v.(bool); !isBool {
+		return errCode("config", "requireIdTokenTypAndAtHash must be true or false")
+	}
+	if v, ok := cfg["acrValues"]; ok && v != nil {
+		var values []string
+		if items, isList := asStringList(v); isList {
+			for _, item := range items {
+				values = append(values, strings.Fields(item)...)
+			}
+		} else {
+			values = strings.Fields(sprint(v))
+		}
+		if len(values) == 0 {
+			delete(cfg, "acrValues")
+		} else {
+			cfg["acrValues"] = strings.Join(values, " ")
+		}
+	}
+	return nil
+}
+
+// numberSetting reads a number of seconds. zeroOK allows 0.
+func numberSetting(cfg map[string]any, name string, fallback float64, zeroOK bool) (float64, error) {
+	v, ok := cfg[name]
+	if !ok || v == nil {
+		return fallback, nil
+	}
+	n, isNumber := asFloat(v)
+	if !isNumber || n < 0 || (n == 0 && !zeroOK) {
+		if zeroOK {
+			return 0, fmtErr("config", "%s must be a number of seconds, 0 or more", name)
+		}
+		return 0, fmtErr("config", "%s must be a number of seconds, more than 0", name)
+	}
+	return n, nil
 }
 
 // ResolveConfig reads a configuration object and fills the defaults.
@@ -175,13 +338,6 @@ func ResolveConfig(raw map[string]any, baseDir string) (map[string]any, error) {
 	}
 	if !containsString(strings.Fields(scopes), "openid") {
 		return nil, errCode("config", "scopes must include openid")
-	}
-	par := "auto"
-	if v, ok := raw["par"]; ok && v != nil {
-		par = sprint(v)
-	}
-	if par != "auto" && par != "always" && par != "never" {
-		return nil, errCode("config", "par must be auto, always, or never")
 	}
 	issuer := ""
 	if v, ok := raw["issuer"]; ok && v != nil && strings.TrimSpace(sprint(v)) != "" {
@@ -264,10 +420,6 @@ func ResolveConfig(raw map[string]any, baseDir string) (map[string]any, error) {
 			}
 		}
 	}
-	checkedRedirect, err := checkRedirect(redirectURI, "redirectUri", allowInsecure)
-	if err != nil {
-		return nil, err
-	}
 	out := map[string]any{}
 	if issuer != "" {
 		out["issuer"] = issuer
@@ -291,28 +443,22 @@ func ResolveConfig(raw map[string]any, baseDir string) (map[string]any, error) {
 		out["privateKeyAlg"] = "RS256"
 	}
 	out["tokenEndpointAuthMethod"] = method
-	out["redirectUri"] = checkedRedirect
+	out["redirectUri"] = redirectURI
 	if post != "" {
-		checked, err := checkRedirect(post, "postLogoutRedirectUri", allowInsecure)
+		out["postLogoutRedirectUri"] = post
+	}
+	out["scopes"] = scopes
+	for _, key := range []string{"idTokenSignedResponseAlg", "par", "dpop", "clockToleranceSec", "maxIdTokenAgeSec", "idTokenSigningAlgs", "requireIdTokenTypAndAtHash", "acrValues"} {
+		if v, ok := raw[key]; ok && v != nil {
+			out[key] = v
+		}
+	}
+	if v, ok := raw["dpopKey"]; ok && v != nil && strings.TrimSpace(sprint(v)) != "" {
+		pemText, err := keyValue(strings.TrimSpace(sprint(v)), baseDir, "the DPoP key")
 		if err != nil {
 			return nil, err
 		}
-		out["postLogoutRedirectUri"] = checked
-	}
-	out["scopes"] = scopes
-	if v, ok := raw["idTokenSignedResponseAlg"]; ok && v != nil && sprint(v) != "" {
-		out["idTokenSignedResponseAlg"] = v
-	}
-	out["par"] = par
-	if v, ok := raw["clockToleranceSec"]; !ok || v == nil {
-		out["clockToleranceSec"] = 30
-	} else {
-		out["clockToleranceSec"] = v
-	}
-	if v, ok := raw["maxIdTokenAgeSec"]; !ok || v == nil {
-		out["maxIdTokenAgeSec"] = 600
-	} else {
-		out["maxIdTokenAgeSec"] = v
+		out["dpopKey"] = pemText
 	}
 	out["allowInsecure"] = allowInsecure
 	if hasCA {
@@ -323,6 +469,9 @@ func ResolveConfig(raw map[string]any, baseDir string) (map[string]any, error) {
 	}
 	if ssf != nil {
 		out["ssf"] = ssf
+	}
+	if err := applySettings(out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
