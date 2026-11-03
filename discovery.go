@@ -80,7 +80,7 @@ func ValidateProviderMetadata(raw map[string]any, expectedIssuer string) (map[st
 			metadata[key] = value
 		}
 	}
-	for _, key := range []string{"token_endpoint_auth_methods_supported", "code_challenge_methods_supported", "scopes_supported", "grant_types_supported"} {
+	for _, key := range []string{"token_endpoint_auth_methods_supported", "code_challenge_methods_supported", "scopes_supported", "grant_types_supported", "dpop_signing_alg_values_supported"} {
 		if v, ok := raw[key]; ok && v != nil {
 			list, ok := asStringList(v)
 			if !ok {
@@ -89,8 +89,10 @@ func ValidateProviderMetadata(raw map[string]any, expectedIssuer string) (map[st
 			metadata[key] = list
 		}
 	}
-	if v, ok := raw["authorization_response_iss_parameter_supported"]; ok && v != nil {
-		metadata["authorization_response_iss_parameter_supported"] = isExactTrue(v)
+	for _, key := range []string{"authorization_response_iss_parameter_supported", "require_pushed_authorization_requests"} {
+		if v, ok := raw[key]; ok && v != nil {
+			metadata[key] = isExactTrue(v)
+		}
 	}
 	responseTypes, ok := asStringList(metadata["response_types_supported"])
 	if !ok || !containsString(responseTypes, "code") {
@@ -160,23 +162,45 @@ func WellKnownURLs(issuer, suffix string) []string {
 	return []string{inserted, appended}
 }
 
+// DefaultIDTokenSigningAlgs is the ID token algorithm allow-list when the
+// configuration names none: RS256 only.
+var DefaultIDTokenSigningAlgs = []string{"RS256"}
+
+// IDTokenAlgorithms is AllowedIDTokenAlgorithms with the default allow-list.
 func IDTokenAlgorithms(advertised []string, pinned string) ([]string, error) {
+	return AllowedIDTokenAlgorithms(advertised, pinned, nil)
+}
+
+// AllowedIDTokenAlgorithms is the set of ID token algorithms this client
+// accepts: the pinned one when there is one, else the allow-list (RS256 when
+// empty), each kept only when the provider advertises it too. "none" is never
+// accepted, and a symmetric algorithm only when it is named.
+func AllowedIDTokenAlgorithms(advertised []string, pinned string, allowed []string) ([]string, error) {
+	wanted := allowed
 	if pinned != "" {
-		if !containsString(advertised, pinned) {
+		wanted = []string{pinned}
+	} else if len(wanted) == 0 {
+		wanted = DefaultIDTokenSigningAlgs
+	}
+	var out []string
+	for _, alg := range wanted {
+		if strings.EqualFold(alg, "none") {
+			return nil, errCode("config", `an unsigned ID token ("none") is never accepted`)
+		}
+		if _, known := algSpecs[alg]; !known {
+			return nil, fmtErr("config", "this client cannot verify ID tokens signed with %s", alg)
+		}
+		if containsString(advertised, alg) && !containsString(out, alg) {
+			out = append(out, alg)
+		}
+	}
+	if len(out) == 0 {
+		if pinned != "" {
 			return nil, fmtErr("discovery", "the provider does not advertise id_token alg %s", pinned)
 		}
-		return []string{pinned}, nil
+		return nil, fmtErr("discovery", "the provider advertises none of the allowed ID token algorithms (allowed %s; advertised %s)", strings.Join(wanted, ", "), strings.Join(advertised, ", "))
 	}
-	var allowed []string
-	for _, alg := range advertised {
-		if containsString(AsymmetricJWSAlgs, alg) {
-			allowed = append(allowed, alg)
-		}
-	}
-	if len(allowed) == 0 {
-		return nil, fmtErr("discovery", "none of the provider's ID token algorithms can be verified (%s)", strings.Join(advertised, ", "))
-	}
-	return allowed, nil
+	return out, nil
 }
 
 func schemeOf(value string) string {

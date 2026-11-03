@@ -24,6 +24,9 @@ type Transaction struct {
 	URL          string
 	MaxAge       *float64
 	ExpectedSub  string
+	// ACRValues are the acr_values requested, space-separated. Complete
+	// requires the ID token's acr to be one of them.
+	ACRValues string
 }
 
 // Login is a completed sign-in. Tokens stay in this process.
@@ -42,9 +45,13 @@ type Login struct {
 	ExpiresAt         float64
 	HasExpires        bool
 	Scope             string
+	// Session is the session-cache handle (CompleteSession), or "".
+	Session string
 }
 
 // AuthorizeOptions are the optional Authentication Request parameters.
+// RedirectURI is held to the same rule as the configured one. ACRValues
+// replaces the acrValues setting for this request.
 type AuthorizeOptions struct {
 	RedirectURI string
 	Scope       string
@@ -84,18 +91,22 @@ type tokenResponse struct {
 
 // RelyingParty is a confidential OpenID Connect client.
 type RelyingParty struct {
-	config    map[string]any
-	metadata  map[string]any
-	key       any
-	algs      []string
-	mu        sync.Mutex
-	jwks      []map[string]any
-	jwksSet   bool
-	usedCodes map[string]float64
-	ccScope   string
-	ccToken   Access
-	ccUntil   float64
-	ccSet     bool
+	config       map[string]any
+	metadata     map[string]any
+	key          any
+	algs         []string
+	dpop         *dpopKey
+	mu           sync.Mutex
+	jwks         []map[string]any
+	jwksSet      bool
+	usedCodes    map[string]float64
+	ccScope      string
+	ccToken      Access
+	ccUntil      float64
+	ccSet        bool
+	nonces       map[string]string
+	store        SessionStore
+	sessionLocks map[string]*sessionLock
 }
 
 func (rp *RelyingParty) Config() map[string]any   { return rp.config }
@@ -112,6 +123,10 @@ func (rp *RelyingParty) TLS() map[string]string {
 func Create(config map[string]any) (*RelyingParty, error) {
 	if config == nil {
 		return nil, errCode("config", "the configuration must be a JSON object")
+	}
+	config = copyConfig(config)
+	if err := applySettings(config); err != nil {
+		return nil, err
 	}
 	method := sprint(config["tokenEndpointAuthMethod"])
 	if method == "private_key_jwt" && sprint(config["privateKeyPem"]) == "" {
@@ -171,17 +186,66 @@ func Create(config map[string]any) (*RelyingParty, error) {
 		key = loaded
 	}
 	pinned := sprint(config["idTokenSignedResponseAlg"])
-	algs, err := IDTokenAlgorithms(stringList(metadata["id_token_signing_alg_values_supported"]), pinned)
+	algs, err := AllowedIDTokenAlgorithms(stringList(metadata["id_token_signing_alg_values_supported"]), pinned, stringList(config["idTokenSigningAlgs"]))
+	if err != nil {
+		return nil, err
+	}
+	parEndpoint := sprint(metadata["pushed_authorization_request_endpoint"])
+	if sprint(config["par"]) == "always" && parEndpoint == "" {
+		return nil, errCode("discovery", "par is always, and the provider has no pushed authorization endpoint")
+	}
+	if isExactTrue(metadata["require_pushed_authorization_requests"]) {
+		if sprint(config["par"]) == "never" {
+			return nil, errCode("config", "par is never, and the provider requires pushed authorization requests")
+		}
+		if parEndpoint == "" {
+			return nil, errCode("discovery", "the provider requires pushed authorization requests and has no pushed authorization endpoint")
+		}
+	}
+	dpop, err := dpopFor(config, metadata)
 	if err != nil {
 		return nil, err
 	}
 	return &RelyingParty{
-		config:    config,
-		metadata:  metadata,
-		key:       key,
-		algs:      algs,
-		usedCodes: map[string]float64{},
+		config:       config,
+		metadata:     metadata,
+		key:          key,
+		algs:         algs,
+		dpop:         dpop,
+		usedCodes:    map[string]float64{},
+		nonces:       map[string]string{},
+		store:        NewMemorySessionStore(),
+		sessionLocks: map[string]*sessionLock{},
 	}, nil
+}
+
+// dpopFor is the DPoP key under the dpop setting, or nil when no proofs are
+// sent: never; auto when the provider does not advertise ES256 for DPoP.
+// always fails when it does not.
+func dpopFor(config, metadata map[string]any) (*dpopKey, error) {
+	mode := sprint(config["dpop"])
+	if mode == "never" {
+		return nil, nil
+	}
+	advertised, listed := asStringList(metadata["dpop_signing_alg_values_supported"])
+	if !containsString(advertised, "ES256") {
+		if mode != "always" {
+			return nil, nil
+		}
+		if !listed {
+			return nil, errCode("discovery", "dpop is always, and the provider does not advertise dpop_signing_alg_values_supported")
+		}
+		return nil, fmtErr("discovery", "dpop is always, and the provider does not advertise ES256 for DPoP (%s)", strings.Join(advertised, ", "))
+	}
+	return newDPoPKey(sprint(config["dpopKey"]))
+}
+
+func copyConfig(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func tlsMap(config map[string]any) map[string]string {
@@ -200,6 +264,12 @@ func (rp *RelyingParty) AuthorizeOptions(opts AuthorizeOptions) (*Transaction, e
 	redirectURI := opts.RedirectURI
 	if redirectURI == "" {
 		redirectURI = sprint(rp.config["redirectUri"])
+	} else if _, err := checkRedirect(redirectURI, "the redirect URI"); err != nil {
+		return nil, err
+	}
+	acrValues := strings.Join(strings.Fields(opts.ACRValues), " ")
+	if acrValues == "" {
+		acrValues = sprint(rp.config["acrValues"])
 	}
 	scope := opts.Scope
 	if scope == "" {
@@ -240,19 +310,24 @@ func (rp *RelyingParty) AuthorizeOptions(opts AuthorizeOptions) (*Transaction, e
 		params["max_age"] = trimFloat(*opts.MaxAge)
 		order = append(order, "max_age")
 	}
-	if opts.ACRValues != "" {
-		params["acr_values"] = opts.ACRValues
+	if acrValues != "" {
+		params["acr_values"] = acrValues
 		order = append(order, "acr_values")
 	}
-	txn := &Transaction{State: state, Nonce: nonce, CodeVerifier: verifier, RedirectURI: redirectURI, MaxAge: opts.MaxAge, ExpectedSub: opts.ExpectedSub}
+	if rp.dpop != nil {
+		params["dpop_jkt"] = rp.dpop.jkt
+		order = append(order, "dpop_jkt")
+	}
+	txn := &Transaction{State: state, Nonce: nonce, CodeVerifier: verifier, RedirectURI: redirectURI, MaxAge: opts.MaxAge, ExpectedSub: opts.ExpectedSub, ACRValues: acrValues}
 	parEndpoint := sprint(rp.metadata["pushed_authorization_request_endpoint"])
 	mode := sprint(rp.config["par"])
-	usePAR := mode == "always" || (mode == "auto" && parEndpoint != "")
-	if mode == "always" && parEndpoint == "" {
-		return nil, errCode("discovery", "par is always, and the provider has no pushed authorization endpoint")
+	required := isExactTrue(rp.metadata["require_pushed_authorization_requests"])
+	usePAR := mode == "always" || (mode == "auto" && parEndpoint != "") || required
+	if usePAR && parEndpoint == "" {
+		return nil, errCode("discovery", "a pushed authorization request is needed, and the provider has no pushed authorization endpoint")
 	}
-	if usePAR && parEndpoint != "" {
-		pushed, err := rp.postForm(parEndpoint, params, order)
+	if usePAR {
+		pushed, _, err := rp.postForm(parEndpoint, params, order)
 		if err != nil {
 			return nil, err
 		}
@@ -340,6 +415,15 @@ func (rp *RelyingParty) Complete(query map[string]string, txn *Transaction) (*Lo
 	}
 	if txn.ExpectedSub != "" && sprint(claims["sub"]) != txn.ExpectedSub {
 		return nil, errCode("validation", "the provider signed in a different account from the one requested")
+	}
+	if requested := strings.Fields(txn.ACRValues); len(requested) > 0 {
+		acr, ok := claims["acr"].(string)
+		if !ok || acr == "" {
+			return nil, errCode("validation", "acr_values was requested, and the ID token has no acr")
+		}
+		if !containsString(requested, acr) {
+			return nil, fmtErr("validation", "the ID token acr %s is not one of the requested acr_values (%s)", acr, strings.Join(requested, " "))
+		}
 	}
 	return loginFrom(tokens, claims), nil
 }
@@ -429,9 +513,12 @@ func (rp *RelyingParty) UserInfo(accessToken, expectedSub string) (map[string]an
 	if endpoint == "" {
 		return nil, errCode("discovery", "the provider has no userinfo_endpoint")
 	}
-	answer, err := send(endpoint, "GET", map[string]string{
-		"accept":        "application/json, application/jwt",
-		"authorization": "Bearer " + accessToken,
+	tokenType := "Bearer"
+	if rp.dpop != nil {
+		tokenType = "DPoP"
+	}
+	answer, err := rp.resourceSend("GET", endpoint, accessToken, tokenType, map[string]string{
+		"accept": "application/json, application/jwt",
 	}, nil, rp.TLS(), "protocol")
 	if err != nil {
 		return nil, err
@@ -443,7 +530,7 @@ func (rp *RelyingParty) UserInfo(accessToken, expectedSub string) (map[string]an
 		return nil, fmtErr("protocol", "userinfo answered %d", answer.Status)
 	}
 	if strings.Contains(answer.ContentType, "application/jwt") {
-		return rp.idToken(strings.TrimSpace(answer.Body), tokenChecks{Algorithms: rp.algs})
+		return rp.idToken(strings.TrimSpace(answer.Body), tokenChecks{Algorithms: rp.algs, NotIDToken: true})
 	}
 	body, err := decodeLoose([]byte(answer.Body))
 	if err != nil {
@@ -535,6 +622,10 @@ func (rp *RelyingParty) checks(extra tokenChecks) tokenChecks {
 	if secret := sprint(rp.config["clientSecret"]); secret != "" {
 		checks.ClientSecret = secret
 	}
+	if !extra.NotIDToken && rp.config["requireIdTokenTypAndAtHash"] != false {
+		checks.RequireTyp = true
+		checks.RequireAtHash = true
+	}
 	keys, err := rp.keys(false)
 	if err == nil {
 		checks.JWKS = keys
@@ -562,7 +653,7 @@ func (rp *RelyingParty) keys(force bool) ([]map[string]any, error) {
 }
 
 func (rp *RelyingParty) token(body map[string]string, order []string) (tokenResponse, error) {
-	parsed, err := rp.postForm(sprint(rp.metadata["token_endpoint"]), body, order)
+	parsed, proofed, err := rp.postForm(sprint(rp.metadata["token_endpoint"]), body, order)
 	if err != nil {
 		return tokenResponse{}, err
 	}
@@ -574,11 +665,11 @@ func (rp *RelyingParty) token(body map[string]string, order []string) (tokenResp
 	if tokenType == "" {
 		return tokenResponse{}, errCode("protocol", "the token response has no token_type")
 	}
-	if strings.EqualFold(tokenType, "dpop") {
-		return tokenResponse{}, errCode("protocol", "the provider returned a DPoP token; this client asked for a Bearer token")
+	if proofed && !strings.EqualFold(tokenType, "DPoP") {
+		return tokenResponse{}, fmtErr("protocol", "a DPoP proof was sent, and the token response token_type is %s, not DPoP", tokenType)
 	}
-	if !strings.EqualFold(tokenType, "bearer") {
-		return tokenResponse{}, fmtErr("protocol", "the token response token_type is %s", tokenType)
+	if !proofed && !strings.EqualFold(tokenType, "Bearer") {
+		return tokenResponse{}, fmtErr("protocol", "no DPoP proof was sent, and the token response token_type is %s, not Bearer", tokenType)
 	}
 	out := tokenResponse{AccessToken: access, TokenType: tokenType}
 	if text, ok := parsed["id_token"].(string); ok {
@@ -596,37 +687,59 @@ func (rp *RelyingParty) token(body map[string]string, order []string) (tokenResp
 	return out, nil
 }
 
-func (rp *RelyingParty) postForm(endpoint string, body map[string]string, order []string) (map[string]any, error) {
-	headers := map[string]string{"accept": "application/json", "content-type": "application/x-www-form-urlencoded"}
-	fields := map[string]string{}
-	for k, v := range body {
-		fields[k] = v
-	}
-	if err := ApplyClientAuth(rp.config, rp.key, fields, headers, sprint(rp.metadata["issuer"])); err != nil {
-		return nil, err
-	}
-	for k := range fields {
-		if !containsString(order, k) {
-			order = append(order, k)
+// postForm posts to the authorization server (PAR or token endpoint) with
+// this client's authentication and, when DPoP is in use, a proof. A 400
+// use_dpop_nonce is retried once with the nonce the response gave. proofed
+// reports whether a proof was sent.
+func (rp *RelyingParty) postForm(endpoint string, body map[string]string, order []string) (map[string]any, bool, error) {
+	proofed := rp.dpop != nil
+	for attempt := 0; ; attempt++ {
+		headers := map[string]string{"accept": "application/json", "content-type": "application/x-www-form-urlencoded"}
+		fields := map[string]string{}
+		for k, v := range body {
+			fields[k] = v
 		}
-	}
-	encoded := formBody(fields, order)
-	answer, err := send(endpoint, "POST", headers, &encoded, rp.TLS(), "protocol")
-	if err != nil {
-		return nil, err
-	}
-	parsed, jerr := decodeLoose([]byte(answer.Body))
-	if answer.Body != "" && jerr != nil {
-		return nil, errCause("protocol", endpoint+" answered "+itoa(answer.Status)+" with no JSON", jerr)
-	}
-	doc, _ := asMap(parsed)
-	if doc == nil {
-		doc = map[string]any{}
-	}
-	if answer.Status != 200 && answer.Status != 201 {
+		if err := ApplyClientAuth(rp.config, rp.key, fields, headers, sprint(rp.metadata["issuer"])); err != nil {
+			return nil, proofed, err
+		}
+		sendOrder := append([]string(nil), order...)
+		for k := range fields {
+			if !containsString(sendOrder, k) {
+				sendOrder = append(sendOrder, k)
+			}
+		}
+		if proofed {
+			proof, err := rp.dpop.proof("POST", endpoint, rp.nonceFor(endpoint), "")
+			if err != nil {
+				return nil, proofed, err
+			}
+			headers["dpop"] = proof
+		}
+		encoded := formBody(fields, sendOrder)
+		answer, err := send(endpoint, "POST", headers, &encoded, rp.TLS(), "protocol")
+		if err != nil {
+			return nil, proofed, err
+		}
+		if proofed {
+			rp.rememberNonce(endpoint, answer.Header)
+		}
+		parsed, jerr := decodeLoose([]byte(answer.Body))
+		if answer.Body != "" && jerr != nil {
+			return nil, proofed, errCause("protocol", endpoint+" answered "+itoa(answer.Status)+" with no JSON", jerr)
+		}
+		doc, _ := asMap(parsed)
+		if doc == nil {
+			doc = map[string]any{}
+		}
+		if answer.Status == 200 || answer.Status == 201 {
+			return doc, proofed, nil
+		}
 		oauth := ""
 		if text, ok := doc["error"].(string); ok {
 			oauth = text
+		}
+		if proofed && attempt == 0 && answer.Status == 400 && oauth == "use_dpop_nonce" && answer.Header.Get("DPoP-Nonce") != "" {
+			continue
 		}
 		description := ""
 		if text, ok := doc["error_description"].(string); ok {
@@ -639,9 +752,8 @@ func (rp *RelyingParty) postForm(endpoint string, body map[string]string, order 
 		if description != "" {
 			message += ": " + description
 		}
-		return nil, errOAuth("protocol", message, oauth)
+		return nil, proofed, errOAuth("protocol", message, oauth)
 	}
-	return doc, nil
 }
 
 func (rp *RelyingParty) rememberCode(code string) error {

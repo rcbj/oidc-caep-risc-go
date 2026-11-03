@@ -73,6 +73,12 @@ type transmitter struct {
 	authorization string
 	verifyState   string
 	verifyStatus  int
+	// dpopToken, when set, is the only access token accepted, as a DPoP-bound
+	// token with a proof; nonce, when set, must be in that proof.
+	dpopToken string
+	nonce     string
+	proofs    int
+	nonceAsks int
 }
 
 func startTransmitter(t *testing.T) *transmitter {
@@ -92,8 +98,33 @@ func (tx *transmitter) serve(w http.ResponseWriter, r *http.Request) {
 	auth := r.Header.Get("Authorization")
 	tx.mu.Lock()
 	tx.authorization = auth
+	dpopToken := tx.dpopToken
+	nonce := tx.nonce
 	tx.mu.Unlock()
-	if auth != "Bearer app-token" && path != "/.well-known/ssf-configuration" && !strings.HasPrefix(path, "/jwks") {
+	open := path == "/.well-known/ssf-configuration" || strings.HasPrefix(path, "/jwks")
+	if dpopToken != "" && !open {
+		if auth != "DPoP "+dpopToken {
+			writeJSON(w, 401, map[string]any{"error": "invalid_token"})
+			return
+		}
+		_, problem := (&providerStub{url: tx.url}).checkProof(r, dpopToken, nonce)
+		if problem == "use_dpop_nonce" {
+			tx.mu.Lock()
+			tx.nonceAsks++
+			tx.mu.Unlock()
+			w.Header().Set("DPoP-Nonce", nonce)
+			w.Header().Set("WWW-Authenticate", `DPoP error="use_dpop_nonce"`)
+			writeJSON(w, 401, map[string]any{"error": "use_dpop_nonce"})
+			return
+		}
+		if problem != "" {
+			writeJSON(w, 401, map[string]any{"error": "invalid_dpop_proof", "error_description": problem})
+			return
+		}
+		tx.mu.Lock()
+		tx.proofs++
+		tx.mu.Unlock()
+	} else if auth != "Bearer app-token" && !open {
 		writeJSON(w, 401, map[string]any{"error": "invalid_token"})
 		return
 	}

@@ -6,7 +6,7 @@ package oidc
 import "fmt"
 
 // OidcError is every failure this module reports.
-// Code is config, discovery, protocol, validation, signature, or ssf.
+// Code is config, discovery, protocol, validation, signature, session, or ssf.
 // OAuthError is the OAuth error code when the provider named one.
 type OidcError struct {
 	Code       string

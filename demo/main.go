@@ -271,11 +271,30 @@ func (a *app) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) home(w http.ResponseWriter, r *http.Request) {
-	_, sess := a.sessionOf(r)
+	sid, sess := a.sessionOf(r)
 	var problem string
 	rp, err := a.relyingParty()
 	if err != nil {
 		problem = "The relying party is not configured yet: " + err.Error() + ". Run scripts/configure_iya_sts.py."
+	}
+	tokenLine := ""
+	if sess != nil && rp != nil {
+		// The library's session cache answers a valid access token, refreshing
+		// it (with a DPoP proof when DPoP is in use) when it has 30 seconds or
+		// less left. A refused refresh removes the cache entry, and the demo
+		// ends the local session with it.
+		access, err := rp.SessionAccessToken(sid)
+		if err != nil {
+			a.endSession(sid)
+			sess = nil
+			problem = "The session ended: " + err.Error()
+		} else {
+			tokenLine = "The access token is a " + access.TokenType + " token"
+			if access.HasExpires {
+				tokenLine += fmt.Sprintf(", good for %d more seconds", int(access.ExpiresAt-float64(time.Now().Unix())))
+			}
+			tokenLine += "."
+		}
 	}
 	if sess != nil && sess.Login != nil {
 		login := sess.Login
@@ -299,7 +318,7 @@ func (a *app) home(w http.ResponseWriter, r *http.Request) {
 			}
 			rows += "<tr><th>" + html.EscapeString(row[0]) + "</th><td>" + html.EscapeString(row[1]) + "</td></tr>"
 		}
-		body := "<h1>Signed in as " + html.EscapeString(who) + "</h1><table class=\"facts\">" + rows + "</table><p><small>The access token and the refresh token stay in this process. This page does not show them.</small></p><p><small>Shared Signals: " + html.EscapeString(a.state()) + "</small></p><form method=\"post\" action=\"/logout\"><button type=\"submit\">Sign out</button></form>"
+		body := "<h1>Signed in as " + html.EscapeString(who) + "</h1><table class=\"facts\">" + rows + "</table><p><small>" + html.EscapeString(tokenLine) + " The access token and the refresh token stay in this process. This page does not show them.</small></p><p><small>Shared Signals: " + html.EscapeString(a.state()) + "</small></p><form method=\"post\" action=\"/logout\"><button type=\"submit\">Sign out</button></form>"
 		a.send(w, 200, page("Signed in", body), "text/html; charset=utf-8", nil)
 		return
 	}
@@ -368,6 +387,9 @@ func (a *app) rememberLiveEvent(event oidc.SignalEvent) {
 		if a.receiver != nil {
 			a.receiver.Untrack(sid)
 		}
+		if a.rp != nil {
+			_ = a.rp.RemoveSession(sid)
+		}
 	}
 }
 
@@ -382,7 +404,7 @@ func (a *app) login(w http.ResponseWriter, r *http.Request) {
 		a.send(w, 500, page("Error", message("Something went wrong", err.Error(), "")), "text/html; charset=utf-8", nil)
 		return
 	}
-	txn := map[string]string{"state": request.State, "nonce": request.Nonce, "code_verifier": request.CodeVerifier, "redirect_uri": request.RedirectURI}
+	txn := map[string]string{"state": request.State, "nonce": request.Nonce, "code_verifier": request.CodeVerifier, "redirect_uri": request.RedirectURI, "acr_values": request.ACRValues}
 	a.redirect(w, http.StatusFound, request.URL, []string{a.cookie(cookieTxn, a.seal(txn), "/callback", 600)})
 }
 
@@ -404,8 +426,10 @@ func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 		a.send(w, 400, page("Sign-in failed", message("Sign-in failed", "validation: this callback is not a sign-in this browser started", "Start again")), "text/html; charset=utf-8", []string{clear})
 		return
 	}
-	request := &oidc.Transaction{State: txn["state"], Nonce: txn["nonce"], CodeVerifier: txn["code_verifier"], RedirectURI: txn["redirect_uri"]}
-	login, err := rp.Complete(query, request)
+	request := &oidc.Transaction{State: txn["state"], Nonce: txn["nonce"], CodeVerifier: txn["code_verifier"], RedirectURI: txn["redirect_uri"], ACRValues: txn["acr_values"]}
+	sid := randomToken()
+	// The library keeps the sign-in's tokens in its session cache under sid.
+	login, err := rp.CompleteSession(query, request, sid)
 	if err != nil {
 		what := err.Error()
 		if oe, ok := err.(*oidc.OidcError); ok {
@@ -414,7 +438,6 @@ func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 		a.send(w, 400, page("Sign-in failed", message("Sign-in failed", what, "Start again")), "text/html; charset=utf-8", []string{clear})
 		return
 	}
-	sid := randomToken()
 	a.mu.Lock()
 	a.sessions[sid] = &session{Login: login, Expires: float64(time.Now().Unix()) + 8*3600}
 	receiver := a.receiver
@@ -427,16 +450,27 @@ func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) logout(w http.ResponseWriter, r *http.Request) {
 	sid, _ := a.sessionOf(r)
-	if sid != "" {
-		a.mu.Lock()
-		delete(a.sessions, sid)
-		receiver := a.receiver
-		a.mu.Unlock()
-		if receiver != nil {
-			receiver.Untrack(sid)
-		}
-	}
+	a.endSession(sid)
 	a.redirect(w, 303, "/", []string{a.cookie(cookieSession, "", "/", 0)})
+}
+
+// endSession ends a local session: the demo's record, the receiver's index
+// and the library's session cache.
+func (a *app) endSession(sid string) {
+	if sid == "" {
+		return
+	}
+	a.mu.Lock()
+	delete(a.sessions, sid)
+	receiver := a.receiver
+	rp := a.rp
+	a.mu.Unlock()
+	if receiver != nil {
+		receiver.Untrack(sid)
+	}
+	if rp != nil {
+		_ = rp.RemoveSession(sid)
+	}
 }
 
 func (a *app) relyingParty() (*oidc.RelyingParty, error) {
@@ -503,6 +537,9 @@ func (a *app) startReceiver(rp *oidc.RelyingParty) {
 	if interval == 0 {
 		interval = 5000
 	}
+	// Client: every transmitter call carries rp's client-credentials token,
+	// with a DPoP proof when that token is DPoP-bound, and an ended session's
+	// entry leaves the library's session cache.
 	receiver, err := oidc.NewSignalsReceiver(sprint(ssf["transmitter"]), func(ids []string, _ oidc.SignalEvent) {
 		a.mu.Lock()
 		for _, id := range ids {
@@ -511,7 +548,8 @@ func (a *app) startReceiver(rp *oidc.RelyingParty) {
 		a.mu.Unlock()
 	}, oidc.ReceiverOptions{
 		TLS:            rp.TLS(),
-		Headers:        func() map[string]string { return a.signalHeaders(rp) },
+		Client:         rp,
+		Scope:          "ssf.manage",
 		Description:    "oidc-caep-risc-go demo (" + sprint(cfg["clientId"]) + ")",
 		PollIntervalMs: interval,
 	})
@@ -531,14 +569,6 @@ func (a *app) startReceiver(rp *oidc.RelyingParty) {
 	a.receiverState = fmt.Sprintf("polling stream %s at %s", sprint(receiver.Stream()["stream_id"]), sprint(ssf["transmitter"]))
 }
 
-func (a *app) signalHeaders(rp *oidc.RelyingParty) map[string]string {
-	access, err := rp.ClientCredentials("ssf.manage")
-	if err != nil {
-		return map[string]string{}
-	}
-	return map[string]string{"authorization": "Bearer " + access.AccessToken}
-}
-
 func (a *app) state() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -555,6 +585,9 @@ func (a *app) sessionOf(r *http.Request) (string, *session) {
 	}
 	if sess.Expires <= float64(time.Now().Unix()) {
 		delete(a.sessions, sid)
+		if a.rp != nil {
+			_ = a.rp.RemoveSession(sid)
+		}
 		return "", nil
 	}
 	return sid, sess

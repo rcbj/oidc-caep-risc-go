@@ -58,6 +58,12 @@ type tokenChecks struct {
 	Code              string
 	PreviousSub       *string
 	MaxAge            *float64
+	// RequireTyp requires the typ header (JWT or application/jwt).
+	RequireTyp bool
+	// RequireAtHash requires at_hash whenever AccessToken is set.
+	RequireAtHash bool
+	// NotIDToken marks a signed UserInfo response: no typ or at_hash rule.
+	NotIDToken bool
 }
 
 func decodePart(token string, index int, what string) (map[string]any, error) {
@@ -170,6 +176,9 @@ func ValidateIDToken(token string, checks tokenChecks) (map[string]any, error) {
 	if header["typ"] != nil {
 		typ = strings.ToLower(sprint(header["typ"]))
 	}
+	if typ == "" && checks.RequireTyp {
+		return nil, errCode("validation", "the ID token header has no typ; it must be JWT or application/jwt")
+	}
 	if typ != "" && ((typ != "jwt" && typ != "application/jwt") || notIDToken[typ]) {
 		return nil, fmtErr("validation", "the ID token typ is %v, not an ID token", header["typ"])
 	}
@@ -219,8 +228,11 @@ func ValidateIDToken(token string, checks tokenChecks) (map[string]any, error) {
 	if nbf, ok := asFloat(payload["nbf"]); ok && nbf-tolerance > now {
 		return nil, errCode("validation", "the ID token was refused: nbf is in the future")
 	}
+	iat, iatOK := asFloat(payload["iat"])
+	if iatOK && iat-tolerance > now {
+		return nil, errCode("validation", "the ID token was refused: iat is in the future")
+	}
 	if checks.MaxIDTokenAgeSec != nil {
-		iat, iatOK := asFloat(payload["iat"])
 		if !iatOK {
 			return nil, errCode("validation", "the ID token was refused: iat is missing")
 		}
@@ -248,6 +260,9 @@ func ValidateIDToken(token string, checks tokenChecks) (map[string]any, error) {
 		return nil, errCode("validation", "the refreshed ID token is for a different subject")
 	}
 	if checks.AccessToken != "" {
+		if payload["at_hash"] == nil && checks.RequireAtHash {
+			return nil, errCode("validation", "the token response carries an access token, and the ID token has no at_hash")
+		}
 		if err := checkHash(payload["at_hash"], checks.AccessToken, alg, "at_hash"); err != nil {
 			return nil, err
 		}

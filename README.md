@@ -6,6 +6,8 @@ JSON configuration keys match the Python library `oidc-caep-risc`. `signals` omi
 
 The license is MIT. Publishing is not set up.
 
+The defaults follow one client profile, shared with the other six libraries: PKCE S256, `state`, `nonce`, RFC 9207 `iss`, PAR when the provider offers it, DPoP when the provider offers ES256, RS256 ID tokens, a required `typ` and `at_hash`, `acr` enforced when requested, and a per-session token cache. See *Settings and defaults*.
+
 ## Usage
 
 ```go
@@ -28,7 +30,44 @@ func main() {
 }
 ```
 
-Tokens stay in this process. Keep the transaction until the browser returns.
+Tokens stay in this process. Keep the transaction until the browser returns (`State`, `Nonce`, `CodeVerifier`, `RedirectURI`, `ACRValues`).
+
+## Settings and defaults
+
+The same defaults and rules apply whether the client is loaded with `FromFile` / `ResolveConfig` or created directly with `Create`. `Create` works on a copy of the map it is given.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `par` | `auto` | `auto` pushes the authorization request when the provider has a PAR endpoint; `always` fails at creation without one; `never` does not push. When the provider's metadata says `require_pushed_authorization_requests: true`, `never` fails at creation and `auto` always pushes. |
+| `dpop` | `auto` | DPoP (RFC 9449). `auto` uses it when the provider's `dpop_signing_alg_values_supported` lists ES256; `always` fails at creation when it does not; `never` sends no proofs. |
+| `dpopKey` | none | A PEM ES256 (P-256) private key (inline, `file:`, `env:`, or a path in a configuration file). Without it the client generates a key when it is created and holds it in memory only. Name one when several processes share sign-ins. |
+| `idTokenSigningAlgs` | `["RS256"]` | The ID token algorithm allow-list. Each algorithm must also be advertised by the provider (the others are dropped; none left fails at creation). `none` is never accepted. A symmetric algorithm (`HS256`...) is accepted only when it is named here. |
+| `idTokenSignedResponseAlg` | none | One pinned algorithm; it replaces the allow-list and must be advertised. |
+| `requireIdTokenTypAndAtHash` | `true` | The ID token header must carry `typ` `JWT` or `application/jwt` (any case), and when the token response carries an access token the ID token must carry a matching `at_hash`. `false` checks each only when present. |
+| `acrValues` | none | A list (or a space-separated string). When set, or when `AuthorizeOptions.ACRValues` is given, the request carries `acr_values`, the transaction keeps them (`Transaction.ACRValues`), and the ID token from the code exchange must carry an `acr` that is one of them. A refresh does not re-check `acr`. |
+| `clockToleranceSec` | `30` | Clock skew allowed on `exp`, `nbf`, `iat` and `auth_time`. An `iat` more than this in the future is refused. |
+| `maxIdTokenAgeSec` | `600` | The oldest `iat` accepted. |
+| `redirectUri`, `postLogoutRedirectUri` | | `https`, or `http` on a loopback host (`localhost`, `127.0.0.1`, `[::1]`). `allowInsecure` does not relax this. `AuthorizeOptions.RedirectURI` is held to the same rule. |
+
+### DPoP
+
+With DPoP on, a proof (`typ` `dpop+jwt`, the public key as `jwk`, `jti`, `htm`, `htu` without query or fragment, `iat`) goes on every request to the PAR endpoint and the token endpoint (code, refresh and client-credentials grants), and `dpop_jkt` goes on the authorization request (in the PAR body when PAR is used). The token response's `token_type` must then be `DPoP` (any case); without a proof it must be `Bearer`. A mismatch is refused.
+
+`UserInfo`, `ResourceRequest(method, url, accessToken, tokenType, headers, body)` and every call the Shared Signals receiver makes to the transmitter (with `ReceiverOptions.Client`) send a DPoP-bound token as `Authorization: DPoP <token>` with a proof carrying `ath`. A 400 `use_dpop_nonce` from the authorization server, or a 401 with `WWW-Authenticate: DPoP error="use_dpop_nonce"` from a resource server, is retried once with the `DPoP-Nonce` the response gave; the latest nonce is kept per server origin and sent on the next proof. `DPoPEnabled()` and `DPoPThumbprint()` report the state.
+
+### The session token cache
+
+```go
+login, err := rp.CompleteSession(query, request, sessionID) // "" makes a handle: login.Session
+access, err := rp.SessionAccessToken(sessionID)             // Access{AccessToken, TokenType, ...}
+err = rp.RemoveSession(sessionID)                           // sign-out
+```
+
+`CompleteSession` is `Complete` that also keeps the sign-in's tokens under a session identifier the application chooses. `SessionAccessToken` returns the cached access token while it has more than 30 seconds left; otherwise it refreshes (with a DPoP proof when DPoP is on), stores the new tokens and returns them. A failed refresh removes the entry and returns an `OidcError` with `Code` `session`. `RemoveSession` clears an entry; a receiver created with `ReceiverOptions{Client: rp}` clears the entry of every session an event ends (a CAEP `session-revoked`). The default store is `MemorySessionStore`; `rp.SetSessionStore(store)` replaces it with any `SessionStore` (`Get`, `Set`, `Delete`), for example one shared across processes.
+
+### The Shared Signals receiver
+
+`ReceiverOptions{Client: rp, Scope: "ssf.manage"}` makes every transmitter call with `rp`'s client-credentials token for that scope, as a DPoP-bound token with proofs when DPoP is on. `Headers` still works when `Client` is nil.
 
 ## Tests
 
@@ -49,7 +88,7 @@ The tests build an in-process stub provider and a stub transmitter. They do not 
 | `*.go` | The library, package `oidc`. Module `github.com/rcbj/oidc-caep-risc-go`. |
 | `*_test.go` | `go test` ports of the Python relying-party and Shared Signals tests. |
 | `demo` | `demo/main.go`. Config is `demo/oidc.json`. Its message pages are drawn with `html/template` (`demo/main_test.go`). |
-| `scripts/configure_iya_sts.py` | Registers the confidential client on iya-sts and writes the listener CA trust chain to the file `tlsCa` names. Loopback redirects follow the running container's `PORT`, then the shell `PORT`. |
+| `scripts/configure_iya_sts.py` | Registers the confidential client on iya-sts (with `id_token_signed_response_alg` RS256, the library's default allow-list) and writes the listener CA trust chain to the file `tlsCa` names. Loopback redirects follow the running container's `PORT`, then the shell `PORT`. |
 | `scripts/live_iya_sts.py` | The live sign-in against iya-sts, separate from the unit suite. |
 | `Dockerfile`, `docker-compose.yml` | The demo image. Compose uses host networking. |
 
@@ -75,7 +114,7 @@ When the install script creates the test user and iya-sts generates its password
 docker compose up --build
 ```
 
-`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` starts `Authorize` and redirects. `GET /callback` completes the code exchange. `POST /logout` signs the local session out. `GET /live-status` is JSON for the sign-in and the Shared Signals events this process has accepted. It does not include tokens.
+`GET /healthz` returns `ok`. `GET /` is the page; it asks the library's session cache for the session's access token (`SessionAccessToken`, refreshing it when needed) and ends the session when that is refused. `GET /login` starts `Authorize` and redirects. `GET /callback` completes the code exchange. `POST /logout` signs the local session out. `GET /live-status` is JSON for the sign-in and the Shared Signals events this process has accepted. It does not include tokens.
 
 `docker-compose.yml` sets `network_mode: host`. The image sets `ENV PORT=3000`. The health check calls `http://127.0.0.1:$PORT/healthz` (it said `$$PORT` until 2026-11-02, which the shell expands to its process ID). The running container's `PORT` wins over the shell's when `scripts/configure_iya_sts.py` registers the application.
 
