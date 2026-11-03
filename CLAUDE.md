@@ -15,7 +15,7 @@ Go 1.27. Cryptography is the standard library.
 | package `oidc` | The library. `FromFile`, `Authorize`, `Complete`. |
 | `*_test.go` | `go test ./...`. A stub provider and a stub transmitter. No live iya-sts. `trust_chain_test.go`: the install script writes the whole chain to `tlsCa`'s path; the library trusts an HTTPS provider through that file, checks the host name, and refuses a forged leaf before the real CAs. |
 | `demo` | `demo/main.go` and `demo/public/`. Config is `demo/oidc.json`. Message pages (errors, a failed sign-in) go through `message()`, an `html/template`, never string concatenation; `demo/main_test.go` checks it escapes the problem text. |
-| `scripts` | `configure_iya_sts.py` registers the confidential client and writes the listener CA trust chain to the file `tlsCa` names. `trust_chain.py` holds `save_trust_chain()` and refreshes that file. `live_iya_sts.py` is the live sign-in, separate from the unit suite. |
+| `scripts` | `configure_iya_sts.py` registers the confidential client (with `oauthIdTokenSignedResponseAlg` RS256, matching the default allow-list) and writes the listener CA trust chain to the file `tlsCa` names. `trust_chain.py` holds `save_trust_chain()` and refreshes that file. `live_iya_sts.py` is the live sign-in, separate from the unit suite. |
 | `Dockerfile`, `docker-compose.yml` | The demo image. Compose uses host networking. |
 
 ## Usage
@@ -23,10 +23,21 @@ Go 1.27. Cryptography is the standard library.
 ```go
 rp, err := oidc.FromFile("oidc.json")
 request, err := rp.Authorize()
-who, err := rp.Complete(query, request)
+who, err := rp.CompleteSession(query, request, sessionID) // or Complete, without the cache
+access, err := rp.SessionAccessToken(sessionID)
 ```
 
-Keep the transaction (`State`, nonce, code verifier) until the browser returns. Tokens stay in this process.
+Keep the transaction (`State`, nonce, code verifier, `ACRValues`) until the browser returns. Tokens stay in this process.
+
+## The client profile (issue #17)
+
+Shared with the six sibling libraries: same JSON keys, same defaults. `applySettings` (`config.go`) is the one place the defaults and the redirect rule live; `ResolveConfig` and `Create` both call it, so a client created directly gets what a file gets. Keys: `par` and `dpop` (`auto`/`always`/`never`), `dpopKey`, `idTokenSigningAlgs` (default `["RS256"]`, intersected with what the provider advertises, `none` never), `idTokenSignedResponseAlg` (one pinned alg), `requireIdTokenTypAndAtHash` (default true), `acrValues`, `clockToleranceSec` 30, `maxIdTokenAgeSec` 600. Redirect URIs: https, or http on `localhost`, `127.0.0.1`, `[::1]`; `allowInsecure` does not widen that, and `AuthorizeOptions.RedirectURI` is checked too. `require_pushed_authorization_requests` forces PAR.
+
+DPoP is `dpop.go`: an ES256 key (generated in memory, or `dpopKey`), proofs on PAR and token requests (`postForm`) and on resource calls (`resourceSend`: UserInfo, `ResourceRequest`, the SSF receiver with `ReceiverOptions.Client`), one retry on `use_dpop_nonce`, the latest nonce per origin. `token()` refuses a `token_type` that does not match whether a proof was sent.
+
+The session cache is `sessions.go`: `CompleteSession`, `SessionAccessToken` (refresh at 30 s or less left; a failed refresh deletes the entry, error code `session`), `RemoveSession`, a replaceable `SessionStore`. The demo uses it, and its receiver passes `Client: rp`.
+
+The stub provider in `rp_test.go` has a knob per rule (`dpopAlgs`, `asNonce`, `rsNonce`, `acr`, `noTyp`, `noAtHash`, `iatAhead`, `expiresIn`, `forceType`, `refreshFails`, `requirePAR`, `idAlgs`) and verifies DPoP proofs; `profile_test.go` holds the tests for each point. The stub transmitter checks DPoP when `dpopToken` is set.
 
 ## Tests
 

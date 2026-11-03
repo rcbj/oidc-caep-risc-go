@@ -74,7 +74,10 @@ func b64uint(n *big.Int) string {
 }
 
 func signIDToken(payload map[string]any, corrupt bool) string {
-	header := map[string]any{"alg": "RS256", "kid": "op", "typ": "JWT"}
+	return signIDTokenHeader(map[string]any{"alg": "RS256", "kid": "op", "typ": "JWT"}, payload, corrupt)
+}
+
+func signIDTokenHeader(header map[string]any, payload map[string]any, corrupt bool) string {
 	hb, _ := json.Marshal(header)
 	pb, _ := json.Marshal(payload)
 	h := base64.RawURLEncoding.EncodeToString(hb)
@@ -155,6 +158,30 @@ type providerStub struct {
 	refresh   map[string]map[string]string
 	access    map[string]map[string]any
 	pushed    map[string]url.Values
+
+	// Issue #17 knobs. Each stays set for the stub's life.
+	dpopAlgs     []string // dpop_signing_alg_values_supported; nil leaves it out
+	requirePAR   bool
+	idAlgs       []string // id_token_signing_alg_values_supported; nil is RS256
+	asNonce      string   // PAR and token proofs must carry it
+	rsNonce      string   // UserInfo proofs must carry it
+	acr          string
+	noTyp        bool
+	noAtHash     bool
+	iatAhead     int64
+	expiresIn    int
+	forceType    string
+	refreshFails bool
+	proofs       []seenProof
+	nonceAsks    int
+	authParams   url.Values
+	bound        map[string]string // access token -> jkt
+}
+
+type seenProof struct {
+	path   string
+	header map[string]any
+	claims map[string]any
 }
 
 func startProvider(t *testing.T) *providerStub {
@@ -165,6 +192,7 @@ func startProvider(t *testing.T) *providerStub {
 		refresh: map[string]map[string]string{},
 		access:  map[string]map[string]any{},
 		pushed:  map[string]url.Values{},
+		bound:   map[string]string{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", stub.serve)
@@ -184,7 +212,7 @@ func (s *providerStub) metadata() map[string]any {
 		"end_session_endpoint":                           s.url + "/end-session",
 		"response_types_supported":                       []string{"code"},
 		"subject_types_supported":                        []string{"public"},
-		"id_token_signing_alg_values_supported":          []string{"RS256"},
+		"id_token_signing_alg_values_supported":          s.idAlgsOr(),
 		"token_endpoint_auth_methods_supported":          []string{"client_secret_basic", "client_secret_post", "private_key_jwt"},
 		"code_challenge_methods_supported":               []string{"S256"},
 		"authorization_response_iss_parameter_supported": true,
@@ -192,14 +220,116 @@ func (s *providerStub) metadata() map[string]any {
 	}
 	s.mu.Lock()
 	par := s.par
+	dpopAlgs := s.dpopAlgs
+	requirePAR := s.requirePAR
 	s.mu.Unlock()
 	if par {
 		doc["pushed_authorization_request_endpoint"] = s.url + "/par"
 	}
+	if dpopAlgs != nil {
+		doc["dpop_signing_alg_values_supported"] = dpopAlgs
+	}
+	if requirePAR {
+		doc["require_pushed_authorization_requests"] = true
+	}
 	return doc
 }
 
-func (s *providerStub) tokenFor(row map[string]string) map[string]any {
+func (s *providerStub) idAlgsOr() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idAlgs == nil {
+		return []string{"RS256"}
+	}
+	return s.idAlgs
+}
+
+// checkProof verifies a DPoP proof the way an authorization or resource
+// server does. It answers the key's thumbprint, or "" and a reason.
+func (s *providerStub) checkProof(r *http.Request, accessToken, nonce string) (string, string) {
+	proof := r.Header.Get("DPoP")
+	if proof == "" {
+		return "", "no proof"
+	}
+	parts := strings.Split(proof, ".")
+	if len(parts) != 3 {
+		return "", "not a JWS"
+	}
+	header, err := decodePart(proof, 0, "header")
+	if err != nil {
+		return "", "header"
+	}
+	claims, err := decodePart(proof, 1, "payload")
+	if err != nil {
+		return "", "payload"
+	}
+	s.mu.Lock()
+	s.proofs = append(s.proofs, seenProof{path: r.URL.Path, header: header, claims: claims})
+	s.mu.Unlock()
+	jwk, _ := asMap(header["jwk"])
+	if header["typ"] != "dpop+jwt" || header["alg"] != "ES256" || jwk == nil || jwk["d"] != nil {
+		return "", "header fields"
+	}
+	key, err := PublicKeyFromJWK(jwk)
+	if err != nil {
+		return "", "jwk"
+	}
+	sig, err := B64URLDecode(parts[2], "sig")
+	if err != nil || !VerifySignature(key, "ES256", []byte(parts[0]+"."+parts[1]), sig) {
+		return "", "signature"
+	}
+	if claims["htm"] != r.Method || claims["htu"] != s.url+r.URL.Path || sprint(claims["jti"]) == "" {
+		return "", "htm/htu/jti"
+	}
+	iat, ok := asFloat(claims["iat"])
+	if !ok || iat < float64(time.Now().Unix()-60) || iat > float64(time.Now().Unix()+60) {
+		return "", "iat"
+	}
+	if accessToken != "" {
+		sum := sha256.Sum256([]byte(accessToken))
+		if claims["ath"] != base64.RawURLEncoding.EncodeToString(sum[:]) {
+			return "", "ath"
+		}
+	} else if claims["ath"] != nil {
+		return "", "ath on a token request"
+	}
+	if nonce != "" && claims["nonce"] != nonce {
+		return "", "use_dpop_nonce"
+	}
+	canonical := `{"crv":"` + sprint(jwk["crv"]) + `","kty":"EC","x":"` + sprint(jwk["x"]) + `","y":"` + sprint(jwk["y"]) + `"}`
+	sum := sha256.Sum256([]byte(canonical))
+	return base64.RawURLEncoding.EncodeToString(sum[:]), ""
+}
+
+// asProof answers a PAR or token request's DPoP header: the thumbprint (""
+// when there is no proof), or false after writing the refusal.
+func (s *providerStub) asProof(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if r.Header.Get("DPoP") == "" {
+		return "", true
+	}
+	s.mu.Lock()
+	nonce := s.asNonce
+	s.mu.Unlock()
+	jkt, problem := s.checkProof(r, "", nonce)
+	if problem == "use_dpop_nonce" {
+		s.mu.Lock()
+		s.nonceAsks++
+		s.mu.Unlock()
+		w.Header().Set("DPoP-Nonce", nonce)
+		writeJSON(w, 400, map[string]any{"error": "use_dpop_nonce", "error_description": "a nonce is required"})
+		return "", false
+	}
+	if problem != "" {
+		writeJSON(w, 400, map[string]any{"error": "invalid_dpop_proof", "error_description": problem})
+		return "", false
+	}
+	if nonce != "" {
+		w.Header().Set("DPoP-Nonce", nonce)
+	}
+	return jkt, true
+}
+
+func (s *providerStub) tokenFor(row map[string]string, jkt string) map[string]any {
 	buf := make([]byte, 16)
 	_, _ = rand.Read(buf)
 	accessToken := base64.RawURLEncoding.EncodeToString(buf)
@@ -216,6 +346,21 @@ func (s *providerStub) tokenFor(row map[string]string) map[string]any {
 	}
 	bad := s.badAtHash
 	corrupt := s.corrupt
+	acr := s.acr
+	noTyp := s.noTyp
+	noAtHash := s.noAtHash
+	iat += s.iatAhead
+	expiresIn := s.expiresIn
+	if expiresIn == 0 {
+		expiresIn = 300
+	}
+	tokenType := "Bearer"
+	if jkt != "" {
+		tokenType = "DPoP"
+	}
+	if s.forceType != "" {
+		tokenType = s.forceType
+	}
 	s.aud = testClient
 	s.corrupt = false
 	s.badAtHash = false
@@ -230,7 +375,17 @@ func (s *providerStub) tokenFor(row map[string]string) map[string]any {
 		"email": row["email"], "name": "Demo User", "preferred_username": row["sub"], "sid": row["sid"],
 		"at_hash": atHash,
 	}
-	token := signIDToken(payload, corrupt)
+	if acr != "" {
+		payload["acr"] = acr
+	}
+	if noAtHash {
+		delete(payload, "at_hash")
+	}
+	header := map[string]any{"alg": "RS256", "kid": "op", "typ": "JWT"}
+	if noTyp {
+		delete(header, "typ")
+	}
+	token := signIDTokenHeader(header, payload, corrupt)
 	s.mu.Lock()
 	s.refresh[refreshToken] = row
 	stored := map[string]any{}
@@ -238,9 +393,12 @@ func (s *providerStub) tokenFor(row map[string]string) map[string]any {
 		stored[k] = v
 	}
 	s.access[accessToken] = stored
+	if jkt != "" {
+		s.bound[accessToken] = jkt
+	}
 	s.mu.Unlock()
 	return map[string]any{
-		"access_token": accessToken, "token_type": "Bearer", "expires_in": 300,
+		"access_token": accessToken, "token_type": tokenType, "expires_in": expiresIn,
 		"refresh_token": refreshToken, "id_token": token, "scope": testScopes,
 	}
 }
@@ -278,11 +436,36 @@ func (s *providerStub) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if path == "/userinfo" {
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		authz := r.Header.Get("Authorization")
+		scheme, token, _ := strings.Cut(authz, " ")
 		token = strings.TrimSpace(token)
 		s.mu.Lock()
 		claims := s.access[token]
+		jkt := s.bound[token]
+		nonce := s.rsNonce
 		s.mu.Unlock()
+		if jkt != "" {
+			if scheme != "DPoP" {
+				writeJSON(w, 401, map[string]any{"error": "invalid_token", "error_description": "a DPoP-bound token sent as " + scheme})
+				return
+			}
+			got, problem := s.checkProof(r, token, nonce)
+			if problem == "use_dpop_nonce" {
+				s.mu.Lock()
+				s.nonceAsks++
+				s.mu.Unlock()
+				w.Header().Set("DPoP-Nonce", nonce)
+				w.Header().Set("WWW-Authenticate", `DPoP error="use_dpop_nonce", error_description="a nonce is required"`)
+				writeJSON(w, 401, map[string]any{"error": "use_dpop_nonce"})
+				return
+			}
+			if problem != "" || got != jkt {
+				writeJSON(w, 401, map[string]any{"error": "invalid_dpop_proof", "error_description": problem})
+				return
+			}
+		} else if scheme != "Bearer" {
+			claims = nil
+		}
 		if claims == nil {
 			writeJSON(w, 401, map[string]any{"error": "invalid_token"})
 			return
@@ -293,6 +476,9 @@ func (s *providerStub) serve(w http.ResponseWriter, r *http.Request) {
 	if path == "/par" && r.Method == http.MethodPost {
 		if !s.authorized(r, text) {
 			writeJSON(w, 401, map[string]any{"error": "invalid_client"})
+			return
+		}
+		if _, ok := s.asProof(w, r); !ok {
 			return
 		}
 		values, _ := url.ParseQuery(text)
@@ -319,6 +505,9 @@ func (s *providerStub) serve(w http.ResponseWriter, r *http.Request) {
 			}
 			params = got
 		}
+		s.mu.Lock()
+		s.authParams = params
+		s.mu.Unlock()
 		redirect := params.Get("redirect_uri")
 		state := params.Get("state")
 		challenge := params.Get("code_challenge")
@@ -349,20 +538,32 @@ func (s *providerStub) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 401, map[string]any{"error": "invalid_client", "error_description": "client authentication failed"})
 			return
 		}
+		jkt, ok := s.asProof(w, r)
+		if !ok {
+			return
+		}
 		params, _ := url.ParseQuery(text)
 		switch params.Get("grant_type") {
 		case "client_credentials":
-			writeJSON(w, 200, map[string]any{"access_token": "cc-token", "token_type": "Bearer", "expires_in": 120, "scope": params.Get("scope")})
+			tokenType := "Bearer"
+			if jkt != "" {
+				tokenType = "DPoP"
+				s.mu.Lock()
+				s.bound["cc-token"] = jkt
+				s.mu.Unlock()
+			}
+			writeJSON(w, 200, map[string]any{"access_token": "cc-token", "token_type": tokenType, "expires_in": 120, "scope": params.Get("scope")})
 			return
 		case "refresh_token":
 			s.mu.Lock()
 			row := s.refresh[params.Get("refresh_token")]
+			fails := s.refreshFails
 			s.mu.Unlock()
-			if row == nil {
+			if row == nil || fails {
 				writeJSON(w, 400, map[string]any{"error": "invalid_grant"})
 				return
 			}
-			minted := s.tokenFor(row)
+			minted := s.tokenFor(row, jkt)
 			s.mu.Lock()
 			claims := map[string]any{}
 			for k, v := range s.access[minted["access_token"].(string)] {
@@ -395,7 +596,7 @@ func (s *providerStub) serve(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		delete(s.codes, code)
 		s.mu.Unlock()
-		writeJSON(w, 200, s.tokenFor(row))
+		writeJSON(w, 200, s.tokenFor(row, jkt))
 		return
 	}
 	writeJSON(w, 404, map[string]any{"error": "not_found"})

@@ -34,6 +34,7 @@ type httpAnswer struct {
 	Status      int
 	ContentType string
 	Body        string
+	Header      http.Header
 }
 
 func tlsConfigFor(ca string) (*tls.Config, error) {
@@ -111,7 +112,7 @@ func send(rawURL, method string, headers map[string]string, body *string, tlsOpt
 	if len(raw) > maxBodyBytes {
 		return httpAnswer{}, fmtErr(code, "%s answered more than %d bytes", rawURL, maxBodyBytes)
 	}
-	return httpAnswer{Status: resp.StatusCode, ContentType: resp.Header.Get("Content-Type"), Body: string(raw)}, nil
+	return httpAnswer{Status: resp.StatusCode, ContentType: resp.Header.Get("Content-Type"), Body: string(raw), Header: resp.Header}, nil
 }
 
 func errorIsTimeout(err error) bool {
