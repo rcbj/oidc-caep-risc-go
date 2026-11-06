@@ -4,7 +4,7 @@ A confidential OpenID Connect relying party for a traditional Go application, an
 
 JSON configuration keys match the Python library `oidc-caep-risc`. `signals` omitted or `true` keeps CAEP and RISC on. `signals: false` does not start the receiver, does not require transmitter metadata, and drops `ssf.read` and `ssf.manage` from the scope list after the default scopes are applied. `DEFAULT_SCOPES` still names those two scopes. The shipped demo leaves `signals` on (the key is omitted).
 
-The license is MIT. Publishing is not set up.
+The license is MIT. A release happens when the library's files changed since the last release's tag: `release.yml` takes one patch above the highest published version, publishes it, and creates the matching tag and GitHub Release. A change to tests, the demo, or the docs releases nothing. To choose a version or start a new minor, raise `VERSION`; the version is stamped in CI and is not committed, so the manifests can trail what is published.
 
 The defaults follow one client profile, shared with the other six libraries: PKCE S256, `state`, `nonce`, RFC 9207 `iss`, PAR when the provider offers it, DPoP when the provider offers ES256, RS256 ID tokens, a required `typ` and `at_hash`, `acr` enforced when requested, and a per-session token cache. See *Settings and defaults*.
 
